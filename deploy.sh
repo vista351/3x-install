@@ -37,7 +37,7 @@ on_error() {
     exit "$rc"
 }
 trap on_error ERR
-trap '[[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"' EXIT
+trap 'if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then rm -rf "$TMP_DIR"; fi' EXIT
 
 require_root() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run this script as root: sudo ./deploy.sh"
@@ -46,8 +46,13 @@ require_root() {
 check_sources() {
     local f
     for f in "$NGINX_ZIP" "$FAIL2BAN_ZIP" "$DOCKER_INSTALLER" "$COMPOSE_SOURCE"; do
-        [[ -f "$f" ]] || die "Required file not found: $f"
+        if [[ ! -f "$f" ]]; then
+            die "Required file not found: $f"
+        fi
     done
+
+    unzip -tq "$NGINX_ZIP" >/dev/null || die "Invalid ZIP archive: $NGINX_ZIP"
+    unzip -tq "$FAIL2BAN_ZIP" >/dev/null || die "Invalid ZIP archive: $FAIL2BAN_ZIP"
 }
 
 validate_domain() {
@@ -79,6 +84,11 @@ install_packages() {
 }
 
 install_docker() {
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        log "Docker and Docker Compose plugin are already installed; skipping installer"
+        return 0
+    fi
+
     log "Installing Docker using install-docker.sh"
     chmod +x "$DOCKER_INSTALLER"
     bash "$DOCKER_INSTALLER"
@@ -100,7 +110,14 @@ create_directories() {
 backup_file() {
     local source="$1"
     local name="$2"
-    [[ -e "$source" ]] && cp -a "$source" "$BACKUP_DIR/$name"
+
+    # Missing files are normal on the first deployment.
+    # Always return success so set -e does not abort the script.
+    if [[ -e "$source" ]]; then
+        cp -a "$source" "$BACKUP_DIR/$name"
+    fi
+
+    return 0
 }
 
 configure_main_nginx() {
@@ -177,6 +194,9 @@ download_geoip() {
     [[ -s "$country_tmp" ]] || die "Downloaded GeoLite2-Country.mmdb is empty"
     [[ -s "$city_tmp" ]] || die "Downloaded GeoLite2-City.mmdb is empty"
 
+    [[ $(stat -c %s "$country_tmp") -gt 1048576 ]] || die "GeoLite2-Country.mmdb download is unexpectedly small"
+    [[ $(stat -c %s "$city_tmp") -gt 1048576 ]] || die "GeoLite2-City.mmdb download is unexpectedly small"
+
     mv -f "$country_tmp" "$GEO_DIR/GeoLite2-Country.mmdb"
     mv -f "$city_tmp" "$GEO_DIR/GeoLite2-City.mmdb"
     chmod 0644 "$GEO_DIR/GeoLite2-Country.mmdb" "$GEO_DIR/GeoLite2-City.mmdb"
@@ -194,8 +214,9 @@ validate_and_start_nginx() {
 install_fail2ban() {
     log "Installing Fail2Ban from the official Git repository"
 
-    local f2b_src
-    f2b_src="$(mktemp -d)/fail2ban"
+    local f2b_build_dir f2b_src
+    f2b_build_dir="$(mktemp -d)"
+    f2b_src="$f2b_build_dir/fail2ban"
 
     git clone --depth 1 https://github.com/fail2ban/fail2ban.git "$f2b_src"
 
@@ -210,6 +231,8 @@ install_fail2ban() {
 
     command -v fail2ban-client >/dev/null 2>&1 || \
         die "Fail2Ban installation failed: fail2ban-client was not found"
+
+    rm -rf "$f2b_build_dir"
 }
 
 configure_fail2ban() {
@@ -238,7 +261,11 @@ configure_fail2ban() {
     fail2ban-client -t
 
     log "Starting Fail2Ban"
-    service fail2ban restart
+    if service fail2ban status >/dev/null 2>&1; then
+        service fail2ban restart
+    else
+        service fail2ban start
+    fi
 
     rm -rf "$f2b_tmp"
 }
